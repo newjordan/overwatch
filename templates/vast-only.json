@@ -1,0 +1,11 @@
+{
+  "ssh_users": {},
+  "default_user": null,
+  "gpu_labels": {},
+  "exclude": [],
+  "order": [],
+  "vast_key": "~/.ssh/fleet_overwatch_ed25519",
+  "vast_user": "root",
+  "tailscale_paths": null,
+  "vastai_paths": null
+}

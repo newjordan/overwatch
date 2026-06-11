@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fleet Overwatch launcher — live GPU/CPU panel across the Tailscale network.
+# readlink -f so this works when invoked through a symlink.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+exec python3 "$(dirname "$SELF")/overwatch.py" "$@"

@@ -1,0 +1,24 @@
+{
+  "ssh_users": {
+    "node-a": "operator",
+    "node-b": "service",
+    "node-c": "admin"
+  },
+  "default_user": null,
+  "gpu_labels": {
+    "node-b": "Example GPU"
+  },
+  "exclude": [
+    "mobile-device",
+    "desktop-os-peer"
+  ],
+  "order": [
+    "node-a",
+    "node-b",
+    "node-c"
+  ],
+  "vast_key": "~/.ssh/fleet_overwatch_ed25519",
+  "vast_user": "root",
+  "tailscale_paths": null,
+  "vastai_paths": null
+}
