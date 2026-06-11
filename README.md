@@ -1,3 +1,4 @@
+<img width="1672" height="941" alt="gpu_overwatch" src="https://github.com/user-attachments/assets/335b2aa5-bbf9-48d1-ad7b-045413098c01" />
 # Fleet Overwatch
 
 Author: Frosty40
@@ -24,6 +25,9 @@ render greyed. Pure Python **stdlib** — no pip, no daemons on the other machin
 │ RAM  2/47G up23h       │ │ RAM  4/15G up3h         │
 └────────────────────────┘ └────────────────────────┘
 ```
+<img width="1920" height="1032" alt="fleet_ops" src="https://github.com/user-attachments/assets/4a472368-5041-4505-b534-0e3e69216474" />
+<img width="1672" height="941" alt="overwatch_1" src="https://github.com/user-attachments/assets/8a87a717-3dfb-4639-8b9d-fedd5d53f957" />
+<img width="1672" height="941" alt="gpu_2" src="https://github.com/user-attachments/assets/f0cf86bc-6431-43a4-ad5a-3fdbffb7caf7" />
 
 ## Looks
 
