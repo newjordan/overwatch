@@ -1,5 +1,7 @@
 # Fleet Overwatch
 
+Author: Frosty40
+
 A terminal "overwatch" panel showing live **GPU/CPU activity across a
 Tailscale network** plus optional **Vast.ai GPU pods**. It is built for
 operators juggling local Linux machines and ephemeral cloud rentals.
