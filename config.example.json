@@ -7,5 +7,37 @@
   "vast_key": "~/.ssh/fleet_overwatch_ed25519",
   "vast_user": "root",
   "tailscale_paths": null,
-  "vastai_paths": null
+  "vastai_paths": null,
+  "hub": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "url": "http://127.0.0.1:8765"
+  },
+  "storage": {
+    "bulk_root": null
+  },
+  "metadata": {
+    "sqlite_path": "./overwatch-hub.sqlite3"
+  },
+  "runner": {
+    "id": null,
+    "name": null,
+    "tags": [],
+    "aliases": [],
+    "work_dir": ".",
+    "poll_interval": 2.0,
+    "checkpoint_path": null,
+    "artifact_limit_mb": 256
+  },
+  "suites": {
+    "local-smoke": {
+      "command": "python3 --version",
+      "target_tags": [],
+      "cwd": ".",
+      "timeout": 30,
+      "artifact_globs": [],
+      "expected_exit": [0],
+      "concurrency_limit": 0
+    }
+  }
 }

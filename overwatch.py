@@ -3065,6 +3065,16 @@ def plain_loop(interval, filter_names, want_fleet, want_vast, allow_attach):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in {"hub", "runner", "mcp"}:
+        command, rest = sys.argv[1], sys.argv[2:]
+        if command == "hub":
+            from overwatch_control.hub import main as control_main
+        elif command == "runner":
+            from overwatch_control.runner import main as control_main
+        else:
+            from overwatch_control.mcp import main as control_main
+        return control_main(rest)
+
     ap = argparse.ArgumentParser(description="Fleet Overwatch — tailnet + Vast GPU/CPU panel")
     ap.add_argument("--config", default=None,
                     help="JSON config path (default: $FLEET_OVERWATCH_CONFIG, "

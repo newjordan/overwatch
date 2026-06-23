@@ -74,6 +74,57 @@ install -Dm755 overwatch ~/.local/bin/overwatch
 overwatch --once
 ```
 
+## Fleet control plane
+
+Overwatch can also run as a Spark-hosted control plane for real job execution.
+Rigs do not need inbound SSH: each rig starts a local runner that registers with
+the hub and polls Spark over Tailscale HTTP for assigned work.
+
+On Spark, configure an external-drive artifact root first:
+
+```json
+{
+  "hub": { "host": "0.0.0.0", "port": 8765, "url": "http://spark:8765" },
+  "storage": { "bulk_root": "/path/to/spark/external/overwatch-artifacts" },
+  "metadata": { "sqlite_path": "./overwatch-hub.sqlite3" },
+  "suites": {
+    "local-smoke": {
+      "command": "python3 --version",
+      "target_tags": ["gpu"],
+      "timeout": 30,
+      "expected_exit": [0],
+      "artifact_globs": []
+    }
+  }
+}
+```
+
+Start the hub and open its dashboard:
+
+```bash
+./overwatch.py hub --config overwatch.config.json
+# dashboard/API: http://spark:8765
+```
+
+On each rig:
+
+```bash
+./overwatch.py runner --config overwatch.config.json --hub-url http://spark:8765 --tag gpu
+```
+
+Agent automation uses the stdio MCP server, which talks to the hub API rather
+than directly to rigs:
+
+```bash
+./overwatch.py mcp --config overwatch.config.json --hub-url http://spark:8765
+```
+
+MCP tools include `list_rigs`, `rig_status`, `submit_job`, `submit_suite`,
+`job_status`, `job_logs`, `job_artifacts`, `cancel_job`, and
+`collect_fleet_snapshot`. Named suites live in config so common checks are
+standardized; ad hoc jobs are still available when a command, target selector,
+timeout, expected exits, and artifact globs are supplied.
+
 With **zero configuration** it probes every Linux tailnet device as the current
 login user. Normal SSH configuration still applies. To pin per-node SSH users
 and display preferences, copy the safe starter config:
