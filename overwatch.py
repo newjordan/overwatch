@@ -28,10 +28,12 @@ the current login user, and normal SSH configuration applies.
   ./overwatch.py --no-vast-attach  # disable the auto-heal attach pass
 
 Keys: q quit · +/- bar theme · c/C color scheme · v/V gauge style · f/F field
-style · g gauge/bars view
+style · g gauge/bars view · a ambient mode (then n/p/1-7 channel · u surf ·
+h HUD)
 """
 
 import argparse
+import calendar
 import curses
 import json
 import locale
@@ -39,11 +41,14 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Configuration ───────────────────────────────────────────────────────────
@@ -164,6 +169,12 @@ echo "==NPROC=="; nproc 2>/dev/null
 echo "==LOAD=="; cat /proc/loadavg 2>/dev/null
 echo "==MEM=="; grep -E "^MemTotal|^MemAvailable" /proc/meminfo 2>/dev/null
 echo "==UPTIME=="; cut -d" " -f1 /proc/uptime 2>/dev/null
+echo "==HYDRA=="
+# Hydra head status (rig-fleet agent mailbox): heads bind 127.0.0.1 only, so each
+# node reports its OWN head inside this same SSH round-trip. Absent head / no curl
+# -> empty section (connection refused is instant; -m 2 only caps a hung head).
+command -v curl >/dev/null 2>&1 && curl -s -m 2 http://127.0.0.1:17876/status 2>/dev/null
+echo ""
 echo "==END=="
 '''
 
@@ -369,6 +380,36 @@ def _cpu_busy_total(cpu_line):
     return total - idle, total
 
 
+def _parse_hydra(sec):
+    """==HYDRA== section: one line of the head's /status JSON, or empty when the
+    node runs no head. Reduced to the counts the panel actually shows — every
+    number here is the head's own report, never synthesized."""
+    raw = "\n".join(sec.get("HYDRA") or []).strip()
+    if not raw:
+        return None
+    try:
+        st = json.loads(raw)
+    except ValueError:
+        return None
+    if not st.get("ok"):
+        return None
+    c = st.get("counts") or {}
+    ib = st.get("inbox_by_status") or {}
+    ob = st.get("outbox_by_status") or {}
+    return {
+        "ok": True,
+        "node_id": ((st.get("identity") or {}).get("node_id") or "")[:8],
+        "inbox_new": ib.get("new", 0) or 0,
+        "inbox_acked": ib.get("acked", 0) or 0,
+        "outbox_queued": ob.get("queued", 0) or 0,
+        "artifacts": c.get("artifacts", 0) or 0,
+        "surfaces": c.get("model_surfaces", 0) or 0,
+        "peers": c.get("peers", 0) or 0,
+        "health": c.get("model_health", 0) or 0,
+        "dead": c.get("dead_letters", 0) or 0,
+    }
+
+
 def _parse_metrics(sec):
     """Shared parse of a probe's sections into gpus + cpu/mem fields."""
     def num(x):
@@ -412,6 +453,7 @@ def _parse_metrics(sec):
         "load": [float(x) for x in load] if load else None,
         "mem_total_kb": mem.get("MemTotal"), "mem_avail_kb": mem.get("MemAvailable"),
         "uptime_s": float(up) if re.match(r"^[\d.]+$", up) else None,
+        "hydra": _parse_hydra(sec),
     }
 
 
@@ -487,6 +529,7 @@ def collect_vast(pod, allow_attach=True):
             return {
                 "status": "ok", "detail": "gpu:pod cpu:host", "gpus": m["gpus"],
                 "cpu_bt": m["cpu_bt"], "ncpu": m["ncpu"], "load": m["load"],
+                "hydra": m.get("hydra"),
                 "mem_total_kb": int(ml * 1024 * 1024) if ml else None,
                 "mem_avail_kb": int((ml - mu) * 1024 * 1024) if (ml is not None and mu is not None) else None,
                 "uptime_s": pod["uptime_mins"] * 60 if pod.get("uptime_mins") else None,
@@ -540,7 +583,7 @@ def _blank(extra):
     base = {"status": "offline", "gpus": [], "cpu_pct": None, "core_pct": None,
             "ncpu": None, "load": None, "mem_total_kb": None, "mem_avail_kb": None,
             "uptime_s": None, "gpukind": "none", "gpu_label": None,
-            "detail": None, "err": None}
+            "detail": None, "err": None, "hydra": None}
     base.update(extra)
     return base
 
@@ -623,6 +666,10 @@ def poll_once(filter_names=None, want_fleet=True, want_vast=True, allow_attach=T
         res = vast_discover()
         refresh_source("vast", res or [], res is not None,
                        lambda p: collect_vast(p, allow_attach))
+    try:
+        hydra_local_poll()                   # local head: surfaces + health history
+    except Exception as e:
+        _log_err("hydra_once", e)
     with LOCK:
         POLL_INFO["ts"] = time.time()
         POLL_INFO["dur"] = time.time() - t0
@@ -653,6 +700,266 @@ def vast_poller(stop, interval, allow_attach):
                 _log_err("vast_poll", e)
         if stop.wait(interval):
             break
+
+
+# ── Hydra head (local, rich) ────────────────────────────────────────────────
+# Remote nodes report bare counts through the SSH probe above; the LOCAL head is
+# on 127.0.0.1 so we can afford the full picture: the registered model surfaces
+# (fleet LLM endpoints) and their verification-probe history straight from the
+# head's SQLite spool, read-only. Count deltas between polls become "events" —
+# real mailbox/artifact/health activity that the ambient channels render as
+# pulses. Nothing here is synthesized: no head, no data.
+HYDRA_URL = "http://127.0.0.1:17876"
+HYDRA_DB = os.path.expanduser("~/.hermes/hydra/hydra.db")
+HYDRA_SPARK_N = 24          # health-probe samples kept per surface for the sparkline
+
+HYDRA_LOCAL = {"ok": False, "identity": {}, "counts": {}, "inbox": {}, "outbox": {},
+               "surfaces": [], "events": deque(maxlen=48), "ts": 0.0}
+_HYD_PREV_COUNTS = {}
+
+
+def _hydra_api(path, body=None, timeout=2.5):
+    """POST (or GET when body is None) to the local head. Returns dict or None."""
+    try:
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(HYDRA_URL + path, data=data,
+                                     headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read().decode())
+        return out if out.get("ok") else None
+    except Exception:
+        return None
+
+
+def _hydra_health_history():
+    """Per-surface verification-probe history from the head's spool (read-only).
+    Returns {surface_id: [(iso_ts, ok), ... oldest→newest]} or {} on any failure."""
+    try:
+        db = sqlite3.connect(f"file:{HYDRA_DB}?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = db.execute(
+                "select surface_id, ok, checked_at from model_health "
+                "order by checked_at desc limit 900").fetchall()
+        finally:
+            db.close()
+    except Exception:
+        return {}
+    hist = {}
+    for sid, ok, ts in rows:
+        lst = hist.setdefault(sid, [])
+        if len(lst) < HYDRA_SPARK_N:
+            lst.append((ts, bool(ok)))
+    return {sid: list(reversed(lst)) for sid, lst in hist.items()}
+
+
+def _hydra_surfaces():
+    """Enriched surface list: registry entry + probe-history sparkline."""
+    res = _hydra_api("/surfaces/list", {})
+    if not res:
+        return []
+    hist = _hydra_health_history()
+    surfaces = []
+    for s in res.get("surfaces") or []:
+        sid = s.get("surface_id") or "?"
+        model = (s.get("model_id") or "?").rsplit("/", 1)[-1]
+        state = s.get("verification_state") or s.get("status") or "?"
+        spark = hist.get(sid) or []
+        surfaces.append({
+            "id": sid, "host": s.get("host_id") or "?", "model": model,
+            "state": state, "roles": s.get("roles") or [],
+            "verified_at": s.get("last_verified_at"),
+            "spark": spark,
+            "ok_rate": (sum(1 for _, o in spark if o) / len(spark)) if spark else None,
+        })
+    rank = {"verified": 0, "candidate": 1}
+    surfaces.sort(key=lambda s: (rank.get(s["state"], 2),
+                                 s["verified_at"] is None, s["id"]))
+    return surfaces
+
+
+def hydra_local_poll(want_surfaces=True):
+    """One sweep of the local head. Count deltas since the previous sweep are
+    recorded as events (they drive the ambient beat/pulse visuals)."""
+    global _HYD_PREV_COUNTS
+    st = _hydra_api("/status")
+    now = time.time()
+    if not st:
+        with LOCK:
+            HYDRA_LOCAL.update({"ok": False, "ts": now})
+        return
+    counts = st.get("counts") or {}
+    events = []
+    if _HYD_PREV_COUNTS:
+        for kind, keys in (("mail-in", ("inbox",)), ("mail-out", ("outbox", "deliveries")),
+                           ("artifact", ("artifacts",)), ("health", ("model_health",)),
+                           ("route", ("routes", "router_decisions"))):
+            d = sum(max(0, (counts.get(k) or 0) - (_HYD_PREV_COUNTS.get(k) or 0))
+                    for k in keys)
+            if d > 0:
+                events.append((now, kind, d))
+    _HYD_PREV_COUNTS = dict(counts)
+    surfaces = _hydra_surfaces() if want_surfaces else None
+    with LOCK:
+        HYDRA_LOCAL.update({
+            "ok": True, "ts": now,
+            "identity": st.get("identity") or {},
+            "counts": counts,
+            "inbox": st.get("inbox_by_status") or {},
+            "outbox": st.get("outbox_by_status") or {},
+        })
+        if surfaces is not None:
+            HYDRA_LOCAL["surfaces"] = surfaces
+        HYDRA_LOCAL["events"].extend(events)
+
+
+def hydra_poller(stop, interval=4.0):
+    n = 0
+    while not stop.is_set():
+        try:
+            hydra_local_poll(want_surfaces=(n % 5 == 0))   # surfaces+history ~every 20s
+        except Exception as e:
+            if not stop.is_set():
+                _log_err("hydra_poll", e)
+        n += 1
+        if stop.wait(interval):
+            break
+
+
+def hydra_activity(now=None):
+    """Decayed 0..1 head-activity level from recent events — the fleet signal's
+    'treble' band. Each event contributes an exponential tail (~8s), so a burst
+    of mail reads as a swell, not a single flash."""
+    now = now or time.time()
+    with LOCK:
+        evs = list(HYDRA_LOCAL["events"])
+    lvl = 0.0
+    for ts, _k, n in evs:
+        age = now - ts
+        if 0 <= age < 40:
+            lvl += min(1.0, 0.35 * n) * math.exp(-age / 8.0)
+    return min(1.0, lvl)
+
+
+def hydra_beat(now=None, window=1.2):
+    """True while any head event is fresher than `window` seconds."""
+    now = now or time.time()
+    with LOCK:
+        return any(0 <= now - ts < window for ts, _k, _n in HYDRA_LOCAL["events"])
+
+
+# ── Fleet signal (telemetry as audio, after crabmusic dsp::AudioParameters) ──
+# The ambient channels are crabmusic visualizers, but the "music" is the fleet
+# itself: bass = GPU load, mid = CPU load, treble = Hydra head activity,
+# spectrum = one bin per real core/GPU, waveform = the poll history, beat = a
+# fresh mailbox event or a genuine GPU-load jump. Every band is a measurement —
+# only the smoothing (a DSP-style envelope follower) is cosmetic, so the
+# picture breathes with the machines instead of stepping with the poll.
+FLEET_HIST = deque(maxlen=720)       # (ts, gpu_pct, cpu_pct, activity01) per sweep
+_BEAT_EVENTS = deque(maxlen=16)      # ts of detected GPU-load jumps
+_SIG_ENV = {"t": None, "bass": 0.0, "mid": 0.0, "treble": 0.0, "amp": 0.0}
+
+
+def _all_gpu(snapshot):
+    """Mean GPU utilization across EVERY live GPU (fleet + vast), or None."""
+    us = [g["util"] for n in snapshot.values() if n.get("status") in ("ok", "api")
+          for g in (n.get("gpus") or []) if g.get("util") is not None]
+    return (sum(us) / len(us)) if us else None
+
+
+def _all_cpu(snapshot):
+    """Cores-weighted CPU utilization across every live node, or None."""
+    num = den = 0.0
+    for n in snapshot.values():
+        if n.get("status") in ("ok", "api") and n.get("cpu_pct") is not None and n.get("ncpu"):
+            num += n["cpu_pct"] * n["ncpu"]
+            den += n["ncpu"]
+    return (num / den) if den else None
+
+
+def note_fleet_sample(snapshot, ts):
+    """Record one history sample per completed poll sweep, and turn a real
+    GPU-load jump (≥12 points between consecutive sweeps) into a beat event."""
+    gpu, cpu = _all_gpu(snapshot), _all_cpu(snapshot)
+    if FLEET_HIST:
+        prev = FLEET_HIST[-1][1]
+        if prev is not None and gpu is not None and gpu - prev >= 12.0:
+            _BEAT_EVENTS.append(ts)
+    FLEET_HIST.append((ts, gpu, cpu, hydra_activity(ts)))
+
+
+def beat_envelope(now=None):
+    """0..1 percussive envelope: max over recent beat sources (GPU jumps and
+    Hydra head events), each decaying like a struck drum (~½s)."""
+    now = now or time.time()
+    env = 0.0
+    for ts in _BEAT_EVENTS:
+        if 0 <= now - ts < 2.5:
+            env = max(env, math.exp(-(now - ts) / 0.5))
+    with LOCK:
+        evs = list(HYDRA_LOCAL["events"])
+    for ts, _k, _n in evs:
+        if 0 <= now - ts < 2.5:
+            env = max(env, math.exp(-(now - ts) / 0.6))
+    return min(1.0, env)
+
+
+def _signal_bins(snapshot):
+    """One spectrum bin per real compute unit, in stable display order:
+    each node's GPUs first (the low end), then its cores. [(pct, node, is_gpu)]"""
+    bins = []
+    for _title, members in grouped(snapshot):
+        for n in members:
+            if n.get("status") not in ("ok", "api"):
+                continue
+            for g in (n.get("gpus") or []):
+                if g.get("util") is not None:
+                    bins.append((g["util"], n["name"], True))
+            for c in (n.get("core_pct") or []):
+                if c is not None:
+                    bins.append((c, n["name"], False))
+    return bins
+
+
+def _hist_wave(idx, width):
+    """Column `idx` of FLEET_HIST resampled to `width` samples (carry-forward
+    over None gaps, 0-filled while warming). Newest sample is last."""
+    vals, last = [], 0.0
+    for row in FLEET_HIST:
+        v = row[idx]
+        if v is not None:
+            last = v
+        vals.append(last)
+    if not vals:
+        return [0.0] * width
+    if len(vals) >= width:
+        return vals[-width:]
+    return [vals[0]] * (width - len(vals)) + vals
+
+
+def fleet_signal(snapshot, t):
+    """Build this frame's FleetSignal dict. Envelope smoothing: fast attack so a
+    burst lands as a hit, slow release so it rings out instead of vanishing."""
+    gpu, cpu = _all_gpu(snapshot), _all_cpu(snapshot)
+    act = hydra_activity(t)
+    targets = {"bass": _frac(gpu), "mid": _frac(cpu), "treble": act}
+    targets["amp"] = min(1.0, 0.5 * targets["bass"] + 0.35 * targets["mid"]
+                         + 0.15 * targets["treble"])
+    dt = min(0.5, t - _SIG_ENV["t"]) if _SIG_ENV["t"] else 0.1
+    _SIG_ENV["t"] = t
+    for k, tgt in targets.items():
+        cur = _SIG_ENV[k]
+        rate = 6.0 if tgt > cur else 1.2               # attack fast, release slow
+        _SIG_ENV[k] = cur + (tgt - cur) * min(1.0, rate * dt)
+    env = beat_envelope(t)
+    return {
+        "gpu_pct": gpu, "cpu_pct": cpu,
+        "bass": _SIG_ENV["bass"], "mid": _SIG_ENV["mid"],
+        "treble": _SIG_ENV["treble"], "amplitude": _SIG_ENV["amp"],
+        "beat": env > 0.55, "beat_env": env,
+        "spectrum": _signal_bins(snapshot),
+        "wave_gpu": _hist_wave(1, 160), "wave_cpu": _hist_wave(2, 160),
+        "wave_act": _hist_wave(3, 160),
+    }
 
 
 # ── Rendering helpers ───────────────────────────────────────────────────────
@@ -1119,13 +1426,18 @@ def load_prefs():
             p = json.load(f)
     except Exception:
         return
-    global DUAL_GAUGE
+    global DUAL_GAUGE, AMBIENT, AMBIENT_HUD
     set_theme(p.get("theme"))
     set_scheme(p.get("scheme"))
     set_gauge(p.get("gauge"))
     set_field(p.get("field"))
+    set_channel(p.get("channel"))
     if isinstance(p.get("dual"), bool):
         DUAL_GAUGE = p["dual"]
+    if isinstance(p.get("ambient"), bool):
+        AMBIENT = p["ambient"]
+    if isinstance(p.get("hud"), bool):
+        AMBIENT_HUD = p["hud"]
 
 
 def save_prefs():
@@ -1137,7 +1449,9 @@ def save_prefs():
                        "scheme": SCHEMES[SCHEME_IDX]["name"],
                        "gauge": GAUGE_STYLES[GAUGE_IDX][0],
                        "field": FIELD_STYLES[FIELD_IDX][0],
-                       "dual": DUAL_GAUGE}, f)
+                       "dual": DUAL_GAUGE, "ambient": AMBIENT,
+                       "channel": CHANNELS[CHANNEL_IDX][0],
+                       "hud": AMBIENT_HUD}, f)
     except Exception:
         pass
 
@@ -1169,6 +1483,17 @@ def fmt_uptime(s):
     if h:
         return f"{h}h{m}m" if m else f"{h}h"
     return f"{m}m"
+
+
+def _iso_age(iso):
+    """Age of an ISO-8601 UTC stamp as a compact '3d'/'2h' string, or '—'."""
+    if not iso:
+        return "—"
+    try:
+        ts = calendar.timegm(time.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return "—"
+    return fmt_uptime(max(0, time.time() - ts))
 
 
 def _pad(runs):
@@ -2256,8 +2581,38 @@ def build_dual_rows(node, compact=False):
     rows.append(_center_row(f"GPU {gpct:.0f}%" if gpct is not None else "GPU ··",
                             grad_key(gpct)))
     if not compact:
-        rows.append(_center_row(GAUGE_STYLES[GAUGE_IDX][2], DIM))  # per-style legend
+        hyd = hydra_row(node.get("hydra"))
+        rows.append(hyd or _center_row(GAUGE_STYLES[GAUGE_IDX][2], DIM))
     return rows
+
+
+def hydra_row(hyd):
+    """One compact line of the node's own Hydra head report — ⬡ head · ✉ inbox
+    new(+acked) · ▸ outbox queued · ◈ model surfaces · ▣ artifacts. Only nodes
+    that actually run a head get the line; every figure is the head's own count."""
+    if not hyd:
+        return None
+    runs = [(" ⬡ ", LABEL),
+            (f"✉{hyd['inbox_new']}", WARN if hyd["inbox_new"] else TEXT),
+            (f"+{hyd['inbox_acked']}", DIM),
+            (f" ▸{hyd['outbox_queued']}", TEXT if hyd["outbox_queued"] else DIM),
+            (f" ◈{hyd['surfaces']}", TEXT),
+            (f" ▣{hyd['artifacts']}", DIM)]
+    if hyd.get("dead"):
+        runs.append((f" ✗{hyd['dead']}", CRIT))
+    return _pad(runs)
+
+
+def hydra_summary(snapshot):
+    """(heads, unread inbox, queued outbox) totalled across every node's head."""
+    heads = new = queued = 0
+    for n in snapshot.values():
+        h = n.get("hydra")
+        if h:
+            heads += 1
+            new += h["inbox_new"]
+            queued += h["outbox_queued"]
+    return heads, new, queued
 
 
 def gpu_row_compact(i, g):
@@ -2363,6 +2718,9 @@ def build_tile(node, compact=False):
                   if mu is not None and mt else f"up{fmt_uptime(node.get('uptime_s'))}")
         rows.append(metric_row("RAM ", mu, mt, rlabel,
                                pct_key(100 * mu / mt if mu is not None and mt else None)))
+        hyd = hydra_row(node.get("hydra"))
+        if hyd:
+            rows.append(hyd)
 
     # Vast footer: cost + location + data source (so it's never mistaken for live fleet).
     if is_vast:
@@ -2767,6 +3125,615 @@ def summary(snapshot):
     return fleet_ok, len(fleet), len(vast), burn
 
 
+# ══ AMBIENT MODE — crabmusic channels ═══════════════════════════════════════
+# A full-screen "channel" view (an homage to crabmusic's channel surfing: 'a'
+# to tune in, n/p to zap, 'u' to channel-surf) where the fleet's live telemetry
+# plays the role of the audio signal (see fleet_signal above). It stays a
+# monitor: a HUD overlay keeps per-node GPU/CPU readouts floating over the art,
+# and the hydra channel is a real dashboard of the agent mesh. Channels reuse
+# the panel's canvas materials (_Braille/_Blocks) and the scheme color ramp, so
+# 'c' recolors the whole experience live.
+AMBIENT = False
+AMBIENT_HUD = True
+CHANNEL_IDX = 0
+_CH_OSD_TS = [0.0]         # last channel-change time: draws the TV-zap OSD briefly
+
+
+def _msg_rows(w, h, msg, key=DIM):
+    """A blank channel frame with one centered message (tiny-terminal fallback)."""
+    rows = [[(" ", DIM)] * w for _ in range(max(1, h))]
+    if rows and w > 4:
+        _stamp_text(rows, h // 2, max(0, (w - len(msg)) // 2), msg[:w], key)
+    return rows
+
+
+def _stamp_text(rows, ri, ci, text, key):
+    """Overlay text onto canvas cell rows (one glyph per cell)."""
+    if not (0 <= ri < len(rows)):
+        return
+    row = rows[ri]
+    for j, chh in enumerate(text):
+        if 0 <= ci + j < len(row):
+            row[ci + j] = (chh, key)
+
+
+def _fill_disc(b, cx, cy, r, key):
+    """Solid dot-space disc via scanline fill."""
+    r = max(1.0, r)
+    for dy in range(-int(r), int(r) + 1):
+        half = math.sqrt(max(0.0, r * r - dy * dy))
+        y = cy + dy
+        for x in range(int(cx - half), int(cx + half) + 1):
+            b.set(x, y, key)
+
+
+def _dotted_line(b, x0, y0, x1, y1, key, step=3):
+    """Sparse line: every `step`-th dot along the segment (calmer than solid)."""
+    dist = math.hypot(x1 - x0, y1 - y0)
+    n = max(1, int(dist / step))
+    for i in range(n + 1):
+        f = i / n
+        b.set(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, key)
+
+
+# ── Channel 1: hydra — the agent mesh, for real ─────────────────────────────
+def ch_hydra(w, h, sig, snap, t):
+    """Constellation of the rig fleet around the local Hydra head: real links,
+    real mailbox counts, mail/artifact/health events as travelling pulses, and
+    the registered model surfaces with their verification-probe history."""
+    if w < 40 or h < 10:
+        return _msg_rows(w, h, "terminal too small for the hydra channel")
+    with LOCK:
+        hyd = {k: HYDRA_LOCAL[k] for k in ("ok", "identity", "counts", "inbox", "outbox", "surfaces")}
+        events = list(HYDRA_LOCAL["events"])
+
+    panel_w = 42 if (w >= 96 and hyd.get("surfaces")) else 0
+    mw = w - panel_w                                   # constellation cell width
+    b = _Braille(mw, h)
+    dw, dh = b.dw, b.dh
+    cx, cy = dw / 2.0, dh / 2.0
+
+    fleet = [n for _s, ms in grouped(snap) for n in ms if n.get("source") == "fleet"]
+    peers = [n for n in fleet if not n.get("is_self")]
+    me = next((n for n in fleet if n.get("is_self")), None)
+
+    # the local head: a hexagon that flares on the beat
+    rh = min(dw, dh) * (0.14 + 0.03 * sig["beat_env"] + 0.015 * math.sin(t * 1.8))
+    hexpts = [(cx + rh * math.cos(math.radians(30 + 60 * j)),
+               cy + rh * math.sin(math.radians(30 + 60 * j))) for j in range(6)]
+    hkey = OK if hyd["ok"] else DIM
+    for j in range(6):
+        x0, y0 = hexpts[j]
+        x1, y1 = hexpts[(j + 1) % 6]
+        b.line(x0, y0, x1, y1, hkey)
+        if sig["beat_env"] > 0.4:
+            b.line(x0 * 1.12 - cx * 0.12, y0 * 1.12 - cy * 0.12,
+                   x1 * 1.12 - cx * 0.12, y1 * 1.12 - cy * 0.12, grad_key(100 * sig["beat_env"]))
+
+    # peers on an ellipse, linked to the head; head-bearing peers link brighter
+    rx, ry = dw * 0.38, dh * 0.36
+    pos = {}
+    for i, n in enumerate(peers):
+        ang = -math.pi / 2 + i * 2 * math.pi / max(1, len(peers))
+        px, py = cx + rx * math.cos(ang), cy + ry * math.sin(ang)
+        pos[i] = (px, py)
+        has_head = bool(n.get("hydra"))
+        _dotted_line(b, cx + rh * math.cos(ang), cy + rh * math.sin(ang), px, py,
+                     FRAME if has_head else DIM, step=2 if has_head else 4)
+        ok = n.get("status") == "ok"
+        nkey = grad_key(node_gpu_util(n) or n.get("cpu_pct") or 3) if ok else DIM
+        for ddx, ddy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1),
+                         (2, 0), (-2, 0), (0, 2), (0, -2)):
+            b.set(px + ddx, py + ddy, nkey)
+
+    # mail/artifact/health pulses travel their link while fresh (<1.6s)
+    for ts, kind, _cnt in events:
+        age = t - ts
+        if not (0 <= age < 1.6) or not peers:
+            continue
+        i = _h32(int(ts * 997)) % len(peers)
+        px, py = pos[i]
+        f = age / 1.6
+        if kind == "mail-in":                          # inbound: peer → head
+            f = 1.0 - f
+        x, y = cx + (px - cx) * f, cy + (py - cy) * f
+        kkey = {"mail-in": OK, "mail-out": LABEL, "artifact": WARN}.get(kind, FRAME)
+        _fill_disc(b, x, y, 1.6, kkey)
+
+    rows = b.rows()
+
+    # text layer: head identity + per-peer labels + live counts
+    ident = hyd.get("identity") or {}
+    host = ident.get("hostname") or "?"
+    ccy = int(cy / 4)
+    _stamp_text(rows, ccy - 1, int(cx / 2) - len(host) // 2, host, LABEL)
+    nid = (ident.get("node_id") or "")[:8]
+    if hyd["ok"]:
+        ib, ob = hyd["inbox"], hyd["outbox"]
+        mail = f"✉{ib.get('new', 0)}+{ib.get('acked', 0)} ▸{ob.get('queued', 0)}"
+        _stamp_text(rows, ccy, int(cx / 2) - len(mail) // 2, mail,
+                    WARN if ib.get("new") else TEXT)
+        _stamp_text(rows, ccy + 1, int(cx / 2) - len(nid) // 2, nid, DIM)
+    else:
+        _stamp_text(rows, ccy, int(cx / 2) - 6, "head offline", DIM)
+    for i, n in enumerate(peers):
+        px, py = pos[i]
+        ci, ri = int(px / 2), int(py / 4)
+        name = n["name"][:12]
+        hydp = n.get("hydra")
+        tag = f"⬡{name}" if hydp else name
+        _stamp_text(rows, ri + 1 if py > cy else ri - 1,
+                    min(mw - len(tag) - 1, max(0, ci - len(tag) // 2)), tag,
+                    TEXT if n.get("status") == "ok" else DIM)
+        if hydp:
+            sub = f"✉{hydp['inbox_new']} ◈{hydp['surfaces']}"
+            _stamp_text(rows, ri + 2 if py > cy else ri - 2,
+                        min(mw - len(sub) - 1, max(0, ci - len(sub) // 2)), sub, DIM)
+    if hyd["ok"]:
+        c = hyd["counts"]
+        foot = (f"✉ {c.get('inbox', 0)} in · {c.get('outbox', 0)} out"
+                f" · ▣ {c.get('artifacts', 0)} artifacts · ♥ {c.get('model_health', 0)} probes"
+                + (f" · ✗ {c.get('dead_letters', 0)} dead" if c.get("dead_letters") else ""))
+        _stamp_text(rows, h - 1, max(0, (mw - len(foot)) // 2), foot, DIM)
+
+    # right panel: the model-surface registry (the fleet's LLM endpoints)
+    if panel_w:
+        for r in rows:
+            r.extend([(" ", DIM)] * panel_w)
+        p0 = mw + 1
+        for ri in range(h):
+            rows[ri][mw] = ("│", FRAME)
+        _stamp_text(rows, 0, p0 + 1, "MODEL SURFACES", LABEL)
+        ri = 2
+        skey = {"verified": OK, "candidate": WARN}
+        for si, s in enumerate(hyd["surfaces"]):
+            if ri + 3 > h:
+                _stamp_text(rows, h - 1, p0 + 1, f"… +{len(hyd['surfaces']) - si} more", DIM)
+                break
+            glyph = {"verified": "●", "candidate": "◐"}.get(s["state"], "○")
+            _stamp_text(rows, ri, p0 + 1, f"{glyph} {s['id'][:panel_w - 4]}",
+                        skey.get(s["state"], DIM))
+            _stamp_text(rows, ri + 1, p0 + 3, s["model"][:panel_w - 5], TEXT)
+            when = s["verified_at"] or (s["spark"][-1][0] if s["spark"] else None)
+            if s["spark"]:
+                for j, (_ts, ok) in enumerate(s["spark"][-(panel_w - 18):]):
+                    rows[ri + 2][p0 + 3 + j] = ("▁", grad_key(30)) if ok else ("█", CRIT_KEYS[-1])
+                pct = f"{100 * s['ok_rate']:.0f}%"
+                _stamp_text(rows, ri + 2, p0 + panel_w - 11, f"{pct:>4} {_iso_age(when):>5}", DIM)
+            else:
+                _stamp_text(rows, ri + 2, p0 + 3, f"no probe history · ✓{_iso_age(when)}", DIM)
+            ri += 3
+    return rows
+
+
+# ── Channel 2: spectrum — every core & GPU as an EQ bin ─────────────────────
+_SPEC_PEAKS = {}
+_SPEC_T = [0.0]
+
+
+def ch_spectrum(w, h, sig, snap, t):
+    """crabmusic spectrum.rs, fleet edition: one analyzer bar per REAL compute
+    unit (GPUs first per node, then its cores), classic bottom-green/top-hot
+    column gradient, decaying peak caps, node names on the axis."""
+    if h < 6 or w < 20:
+        return _msg_rows(w, h, "terminal too small for spectrum")
+    rows = [[(" ", DIM)] * w for _ in range(h)]
+    bins = sig["spectrum"]
+    if not bins:
+        return _msg_rows(w, h, "no live nodes — nothing to analyze")
+    while len(bins) > max(8, w // 2):                  # too many cores for the width:
+        bins = [(max(a[0], b_[0]), a[1], a[2] or b_[2])  # merge neighbours, keep peaks
+                for a, b_ in zip(bins[::2], bins[1::2] + bins[-1:])]
+    n = len(bins)
+    bw = max(1, w // n)
+    gap = 1 if bw >= 3 else 0
+    x0 = max(0, (w - n * bw) // 2)
+    bar_h = h - 2
+    dt = min(0.5, t - _SPEC_T[0]) if _SPEC_T[0] else 0.1
+    _SPEC_T[0] = t
+    for i, (pct, _name, is_gpu) in enumerate(bins):
+        v = _frac(pct)
+        pk = max(v, _SPEC_PEAKS.get(i, 0.0) - 0.22 * dt)
+        _SPEC_PEAKS[i] = pk
+        cells = v * bar_h
+        full = int(cells)
+        for k in range(full):
+            key = grad_key((k + 1) / bar_h * 100.0)
+            for bx in range(bw - gap):
+                rows[bar_h - 1 - k][x0 + i * bw + bx] = ("█", key)
+        rem = cells - full
+        if full < bar_h and rem > 0.08:
+            key = grad_key((full + 1) / bar_h * 100.0)
+            for bx in range(bw - gap):
+                rows[bar_h - 1 - full][x0 + i * bw + bx] = (_VBLK[max(1, int(rem * 8))], key)
+        pky = bar_h - 1 - min(bar_h - 1, int(pk * bar_h))
+        for bx in range(bw - gap):                     # the falling peak cap
+            if rows[pky][x0 + i * bw + bx][0] == " ":
+                rows[pky][x0 + i * bw + bx] = ("▂", LABEL)
+    axis_key = grad_key(100 * sig["beat_env"]) if sig["beat_env"] > 0.5 else FRAME
+    for x in range(w):
+        rows[bar_h][x] = ("▔", axis_key)
+    # axis labels: node name centered under its bin span; ▲ marks GPU bins
+    start = 0
+    while start < n:
+        name = bins[start][1]
+        end = start
+        while end < n and bins[end][1] == name:
+            end += 1
+        span_x0, span_x1 = x0 + start * bw, x0 + end * bw - gap
+        label = name[:max(0, span_x1 - span_x0)]
+        _stamp_text(rows, h - 1, max(span_x0, (span_x0 + span_x1 - len(label)) // 2),
+                    label, DIM)
+        start = end
+    for i, (_p, _nm, is_gpu) in enumerate(bins):
+        if is_gpu:
+            rows[bar_h][x0 + i * bw] = ("▲", LABEL)
+    return rows
+
+
+# ── Channel 3: scope — the fleet load oscilloscope ──────────────────────────
+def ch_scope(w, h, sig, snap, t):
+    """crabmusic oscilloscope.rs on the poll history: GPU trace in the load
+    gradient, CPU trace dim, Hydra activity as a faint band at the base.
+    X = time (one poll per sample), Y = utilization."""
+    if h < 5 or w < 24:
+        return _msg_rows(w, h, "terminal too small for scope")
+    b = _Braille(w, h)
+    dw, dh = b.dw, b.dh
+    for gy in range(0, dh, 8):                         # graticule
+        for gx in range(0, dw, 6):
+            b.set(gx, gy, DIM)
+    for gx in range(0, dw, 2):
+        b.set(gx, dh // 2, DIM)
+
+    def trace(wave, scale, key_fn):
+        prev = None
+        for x in range(dw):
+            v = wave[int(x * len(wave) / dw)] or 0.0
+            y = (dh - 3) - _frac(v * scale) * (dh - 6)   # 2-dot floor: idle stays visible
+            if prev is not None:
+                b.line(x - 1, prev, x, y, key_fn(v))
+            prev = y
+        return prev
+
+    trace(sig["wave_act"], 100.0, lambda v: WARN if v > 0.25 else FRAME)
+    trace(sig["wave_cpu"], 1.0, lambda v: FRAME)
+    yg = trace(sig["wave_gpu"], 1.0, lambda v: grad_key(v))
+    if yg is not None:                                 # sweep head glow
+        _fill_disc(b, dw - 1, yg, 1.5, LABEL)
+    rows = b.rows()
+    for pct in (25, 50, 75, 100):                      # scale rulings
+        _stamp_text(rows, int((dh - 3 - pct / 100.0 * (dh - 6)) / 4), 0, f"{pct:>3}", DIM)
+    g, c = sig["gpu_pct"], sig["cpu_pct"]
+    _stamp_text(rows, 0, w - 11, f"GPU {g:5.1f}%" if g is not None else "GPU     ··",
+                grad_key(g))
+    _stamp_text(rows, 1, w - 11, f"CPU {c:5.1f}%" if c is not None else "CPU     ··", FRAME)
+    _stamp_text(rows, 2, w - 11, f"HYD {sig['treble']:5.2f} ", WARN if sig["treble"] > 0.25 else DIM)
+    mins = len(FLEET_HIST) * 2.5 / 60.0
+    _stamp_text(rows, h - 1, 1, f"◂ {mins:.0f} min of samples", DIM)
+    return rows
+
+
+# ── Channel 4: starfield — warp speed ∝ GPU load ────────────────────────────
+def ch_starfield(w, h, sig, snap, t):
+    """crabmusic starfield.rs: stars stream outward at a pace set by the GPU
+    bass band; heavy load stretches them into warp streaks; Hydra mail crosses
+    the field as comets. Deterministic per-star hashes — resize-proof."""
+    if h < 4 or w < 16:
+        return _msg_rows(w, h, "terminal too small for starfield")
+    b = _Braille(w, h)
+    dw, dh = b.dw, b.dh
+    cx, cy = dw / 2.0, dh / 2.0
+    rmax = math.hypot(cx, cy)
+    speed = 0.05 + sig["bass"] * 0.75 + sig["beat_env"] * 0.2
+    for i in range(260):
+        hv = _h32(i * 2654435761 + 97)
+        ang = (hv % 6283) / 1000.0
+        ph = ((hv >> 8) & 0x3FF) / 1023.0
+        spf = 0.4 + ((hv >> 18) & 0xFF) / 255.0
+        z = (t * speed * spf + ph) % 1.0
+        r = z * z * rmax
+        x, y = cx + math.cos(ang) * r, cy + math.sin(ang) * r
+        twinkle = 0.55 + 0.45 * math.sin(t * (1.1 + (hv & 7) * 0.33) + hv % 63)
+        key = DIM if z * twinkle < 0.3 else grad_key(
+            100 * z * max(0.25, sig["bass"]) * twinkle)
+        if z > 0.5 and (sig["bass"] > 0.45 or sig["beat_env"] > 0.35):
+            z2 = max(0.0, z - 0.05 - 0.12 * max(sig["bass"] - 0.3, sig["beat_env"]))
+            r2 = z2 * z2 * rmax
+            b.line(cx + math.cos(ang) * r2, cy + math.sin(ang) * r2, x, y, key)
+        else:
+            b.set(x, y, key)
+            if z > 0.72:                               # near stars carry more light
+                b.set(x + 1, y, key)
+    with LOCK:
+        events = list(HYDRA_LOCAL["events"])
+    for ts, kind, _n in events:                        # mail comets cross the field
+        age = t - ts
+        if not (0 <= age < 2.0):
+            continue
+        hv = _h32(int(ts * 997))
+        ang = (hv % 6283) / 1000.0
+        f = age / 2.0
+        r = f * rmax
+        x, y = cx + math.cos(ang) * r, cy + math.sin(ang) * r
+        r2 = max(0.0, r - rmax * 0.12)
+        b.line(cx + math.cos(ang) * r2, cy + math.sin(ang) * r2, x, y, FRAME)
+        _fill_disc(b, x, y, 1.4, {"mail-in": OK, "mail-out": LABEL}.get(kind, WARN))
+    rows = b.rows()
+    if sig["gpu_pct"] is not None:
+        _stamp_text(rows, h - 1, 1, f"warp {sig['bass']:4.2f} · gpu {sig['gpu_pct']:3.0f}%", DIM)
+    return rows
+
+
+# ── Channel 5: tunnel — grid tunnel, pace ∝ CPU ─────────────────────────────
+def ch_tunnel(w, h, sig, snap, t):
+    """crabmusic grid_tunnel.rs: nested frames rush past at CPU pace, drifting
+    off-axis like a lazy flight path; the nearest ring flashes on the beat."""
+    if h < 5 or w < 20:
+        return _msg_rows(w, h, "terminal too small for tunnel")
+    b = _Braille(w, h)
+    dw, dh = b.dw, b.dh
+    cx = dw / 2.0 + math.sin(t * 0.21) * dw * 0.07
+    cy = dh / 2.0 + math.cos(t * 0.27) * dh * 0.07
+    speed = 0.04 + sig["mid"] * 0.5 + sig["beat_env"] * 0.08
+    NR = 9
+    rings = sorted(((k / NR + t * speed) % 1.0) for k in range(NR))
+    for zf in rings:
+        s = zf * zf
+        hw, hh = s * dw * 0.62, s * dh * 0.62
+        key = (grad_key(96) if (zf == rings[-1] and sig["beat_env"] > 0.5)
+               else grad_key(100 * zf * max(0.25, sig["mid"] + 0.15)))
+        x0, y0, x1, y1 = cx - hw, cy - hh, cx + hw, cy + hh
+        b.line(x0, y0, x1, y0, key)
+        b.line(x1, y0, x1, y1, key)
+        b.line(x1, y1, x0, y1, key)
+        b.line(x0, y1, x0, y0, key)
+    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        _dotted_line(b, cx, cy, cx + sx * dw * 0.62, cy + sy * dh * 0.62, FRAME, step=5)
+    rows = b.rows()
+    if sig["cpu_pct"] is not None:
+        _stamp_text(rows, h - 1, 1, f"pace {sig['mid']:4.2f} · cpu {sig['cpu_pct']:3.0f}%", DIM)
+    return rows
+
+
+# ── Channel 6: well — gravity well, mass = VRAM in use ──────────────────────
+def ch_well(w, h, sig, snap, t):
+    """crabmusic gravity_well.rs: the central mass is the fleet's VRAM actually
+    in use; every live node is a body orbiting at its own CPU pace, colored by
+    its GPU load, trailing dots. Spiral arms carry the Hydra activity."""
+    if h < 7 or w < 28:
+        return _msg_rows(w, h, "terminal too small for gravity well")
+    b = _Braille(w, h)
+    dw, dh = b.dw, b.dh
+    cx, cy = dw / 2.0, dh / 2.0
+    used = total = 0.0
+    for n in snap.values():
+        if n.get("status") in ("ok", "api"):
+            for g in (n.get("gpus") or []):
+                if g.get("mem_used") is not None and g.get("mem_total"):
+                    used += g["mem_used"]
+                    total += g["mem_total"]
+    mfrac = (used / total) if total else 0.0
+    rmax = min(dw, dh) / 2.0 - 2
+    R = rmax * (0.14 + 0.38 * mfrac) * (1.0 + 0.05 * math.sin(t * 1.6)
+                                        + 0.10 * sig["beat_env"])
+    _fill_disc(b, cx, cy, R, grad_key(100 * mfrac if total else None))
+    b.arc(cx, cy, R + 1.5, 0, 2 * math.pi, LABEL)
+    for arm in range(2):                               # hydra-activity spiral arms
+        for k in range(0, 60):
+            th = k / 60.0 * 3 * math.pi + arm * math.pi + t * 0.25
+            rr = R + 2 + (k / 60.0) * (rmax - R - 2)
+            if k % (2 if sig["treble"] > 0.3 else 4) == 0:
+                b.set(cx + rr * math.cos(th), cy + rr * math.sin(th),
+                      WARN if sig["treble"] > 0.3 else FRAME)
+    bodies = [n for _s, ms in grouped(snap) for n in ms if n.get("status") in ("ok", "api")]
+    rows_reserved = []
+    for i, n in enumerate(bodies):
+        orbit = R + 4 + (i + 1) * max(3.0, (rmax - R - 6) / max(1, len(bodies)))
+        ang = t * (0.10 + _frac(n.get("cpu_pct")) * 0.9) + i * 2.399
+        px, py = cx + orbit * math.cos(ang), cy + orbit * math.sin(ang) * 0.85
+        key = grad_key(node_gpu_util(n) or 4)
+        for j in range(6):                             # decaying trail
+            ta = ang - (j + 1) * 0.05
+            b.set(cx + orbit * math.cos(ta), cy + orbit * math.sin(ta) * 0.85,
+                  FRAME if j < 3 else DIM)
+        _fill_disc(b, px, py, 1.4, key)
+        rows_reserved.append((int(py / 4), int(px / 2), n["name"][:10], key))
+    rows = b.rows()
+    for ri, ci, name, key in rows_reserved:
+        _stamp_text(rows, min(h - 1, ri + 1), min(w - len(name) - 1, max(0, ci - len(name) // 2)),
+                    name, key)
+    lbl = (f"VRAM {used / 1024:.0f}/{total / 1024:.0f}G" if total else "no VRAM data")
+    _stamp_text(rows, int(cy / 4), int(cx / 2) - len(lbl) // 2, lbl, LABEL)
+    return rows
+
+
+# ── Channel 7: mandala — breathing rose, petals = live nodes ────────────────
+def ch_mandala(w, h, sig, snap, t):
+    """crabmusic mandala.rs / flower_of_life.rs: a rose curve with one petal
+    pair per live node, breathing with the fleet amplitude, over a faint
+    flower-of-life lattice; the outer halo rings on the beat. The do-nothing-
+    but-feel-good channel — the numbers stay in the HUD."""
+    if h < 6 or w < 24:
+        return _msg_rows(w, h, "terminal too small for mandala")
+    b = _Braille(w, h)
+    dw, dh = b.dw, b.dh
+    cx, cy = dw / 2.0, dh / 2.0
+    live = sum(1 for n in snap.values() if n.get("status") in ("ok", "api"))
+    k = max(3, min(12, live * 2))
+    breathe = 0.55 + 0.45 * sig["amplitude"]
+    R = min(dw, dh) * 0.47 * (0.6 + 0.4 * breathe)
+    rot = t * 0.10 + sig["treble"] * 0.6
+    rl = R / 3.2
+    for j in range(7):                                 # flower-of-life lattice
+        ang = j * math.pi / 3 + rot * 0.5
+        ox = cx + (rl * math.cos(ang) if j else 0)
+        oy = cy + (rl * math.sin(ang) if j else 0)
+        b.arc(ox, oy, rl, 0, 2 * math.pi, DIM)
+    steps = 720
+    for i in range(steps):
+        th = i / steps * 2 * math.pi
+        r = R * abs(math.sin(k / 2.0 * th + rot))
+        v = (r / R) if R else 0
+        b.set(cx + r * math.cos(th), cy + r * math.sin(th),
+              grad_key(100 * v * (0.25 + 0.75 * sig["amplitude"])))
+        r2 = R * 0.45 * abs(math.sin(k / 2.0 * th - rot * 1.7))
+        if i % 2 == 0:
+            b.set(cx + r2 * math.cos(-th), cy + r2 * math.sin(-th), FRAME)
+    if sig["beat_env"] > 0.25:
+        b.arc(cx, cy, R * (1.02 + 0.1 * sig["beat_env"]), 0, 2 * math.pi,
+              grad_key(100 * sig["beat_env"]))
+    rows = b.rows()
+    _stamp_text(rows, h - 1, 1, f"{live} nodes · amp {sig['amplitude']:4.2f}", DIM)
+    return rows
+
+
+CHANNELS = [
+    ("hydra", ch_hydra, "the agent mesh — heads, mail, model surfaces"),
+    ("spectrum", ch_spectrum, "every core & GPU as an EQ bin"),
+    ("scope", ch_scope, "fleet load oscilloscope"),
+    ("starfield", ch_starfield, "warp speed rides the GPUs"),
+    ("tunnel", ch_tunnel, "grid tunnel at CPU pace"),
+    ("well", ch_well, "gravity well, mass = VRAM in use"),
+    ("mandala", ch_mandala, "breathing rose, petals = live nodes"),
+]
+
+
+def set_channel(name):
+    global CHANNEL_IDX
+    for i, (n, _f, _d) in enumerate(CHANNELS):
+        if n == (name or "").lower():
+            CHANNEL_IDX = i
+            return True
+    return False
+
+
+def cycle_channel(delta):
+    global CHANNEL_IDX
+    CHANNEL_IDX = (CHANNEL_IDX + delta) % len(CHANNELS)
+    _CH_OSD_TS[0] = time.time()
+    save_prefs()
+
+
+def select_channel(i):
+    global CHANNEL_IDX
+    if 0 <= i < len(CHANNELS):
+        CHANNEL_IDX = i
+        _CH_OSD_TS[0] = time.time()
+        save_prefs()
+
+
+def surf_channel():
+    """crabmusic's 'U': tune to a random OTHER channel."""
+    global CHANNEL_IDX
+    CHANNEL_IDX = (CHANNEL_IDX + 1 + _h32(int(time.time() * 977)) % (len(CHANNELS) - 1)) \
+        % len(CHANNELS)
+    _CH_OSD_TS[0] = time.time()
+    save_prefs()
+
+
+def toggle_ambient():
+    global AMBIENT
+    AMBIENT = not AMBIENT
+    save_prefs()
+
+
+def toggle_hud():
+    global AMBIENT_HUD
+    AMBIENT_HUD = not AMBIENT_HUD
+    save_prefs()
+
+
+def blit_rows(put, rows, y0, x0, max_w):
+    """Paint canvas cell rows with run-coalescing; blank cells are skipped
+    entirely (the screen was just erased), so mostly-empty frames stay cheap."""
+    for ri, row in enumerate(rows):
+        buf, key, bx = "", None, 0
+        for ci, (chh, k) in enumerate(row):
+            if ci >= max_w:
+                break
+            blank = chh == " " or chh == _BEAT_BLANK
+            if blank or k != key:
+                if buf:
+                    put(y0 + ri, x0 + bx, buf, key)
+                buf, key, bx = ("", None, ci) if blank else (chh, k, ci)
+            else:
+                buf += chh
+        if buf:
+            put(y0 + ri, x0 + bx, buf, key)
+
+
+HUD_W = 30
+
+
+def hud_overlay(put, snapshot, y0, x0):
+    """The 'useful' layer floating over the art: one row per live node with a
+    theme-rendered GPU bar + GPU/CPU readouts, then pods/burn and head mail."""
+    fleet = [n for _s, ms in grouped(snapshot) for n in ms if n.get("source") == "fleet"]
+    vast = [n for n in snapshot.values() if n.get("source") == "vast"]
+    live = [n for n in fleet if n.get("status") == "ok"]
+    off = len(fleet) - len(live)
+    put(y0, x0, "┌─ FLEET ", FRAME)
+    put(y0, x0 + 9, "─" * (HUD_W - 16), FRAME)
+    put(y0, x0 + HUD_W - 7, " g% c%┐", FRAME)
+    y = y0 + 1
+    for n in live:
+        g, c = node_gpu_util(n), n.get("cpu_pct")
+        put(y, x0, "│", FRAME)
+        name = (("⬡" if n.get("hydra") else " ") + n["name"])[:9]
+        put(y, x0 + 1, f"{name:<9}", TEXT)
+        cx = x0 + 10
+        for txt, k in bar_runs(g, 100, 10):
+            put(y, cx, txt, k)
+            cx += len(txt)
+        put(y, x0 + 20, f"{g:4.0f}" if g is not None else "   ·", grad_key(g))
+        put(y, x0 + 24, f"{c:4.0f} " if c is not None else "   · ", grad_key(c))
+        put(y, x0 + HUD_W - 1, "│", FRAME)
+        y += 1
+    foots = []
+    if off:
+        foots.append((f" {off} offline", DIM))
+    burn = sum((n.get("dph") or 0) for n in vast if n.get("status") in ("ok", "api"))
+    if vast:
+        foots.append((f" {len(vast)} pods ${burn:.2f}/hr", LABEL))
+    heads, mail_new, mail_q = hydra_summary(snapshot)
+    if heads:
+        foots.append((f" ⬡{heads} ✉{mail_new}" + (f" ▸{mail_q}" if mail_q else ""),
+                      WARN if mail_new else TEXT))
+    for txt, k in foots:
+        put(y, x0, "│", FRAME)
+        put(y, x0 + 1, f"{txt:<{HUD_W - 2}}"[:HUD_W - 2], k)
+        put(y, x0 + HUD_W - 1, "│", FRAME)
+        y += 1
+    put(y, x0, "└" + "─" * (HUD_W - 2) + "┘", FRAME)
+
+
+def draw_ambient(put, rows_h, cols_w, snapshot, t):
+    """One ambient frame: the channel canvas, the HUD, and the channel bar."""
+    sig = fleet_signal(snapshot, t)
+    name, fn, blurb = CHANNELS[CHANNEL_IDX]
+    canvas_h = rows_h - 2
+    try:
+        rows = fn(cols_w, canvas_h, sig, snapshot, t)
+    except Exception as e:
+        _log_err(f"channel {name}", e)
+        rows = _msg_rows(cols_w, canvas_h, f"channel error: {e}", CRIT)
+    blit_rows(put, rows, 1, 0, cols_w)
+    if AMBIENT_HUD and cols_w > HUD_W + 44 and rows_h > 8:
+        # the hydra channel keeps its surface registry on the right — HUD goes left
+        hud_x = 1 if name == "hydra" else cols_w - HUD_W - 1
+        hud_overlay(put, snapshot, 1, hud_x)
+    zap = t - _CH_OSD_TS[0]
+    if 0 <= zap < 1.6 and rows_h > 6:                  # TV-zap OSD on channel change
+        osd = f"▐ CH {CHANNEL_IDX + 1} · {name.upper()} ▌"
+        put(2, max(0, (cols_w - len(osd)) // 2), osd,
+            LABEL if zap < 1.1 else DIM)
+    bar = f"♪ ch{CHANNEL_IDX + 1}/{len(CHANNELS)} {name} — {blurb}"
+    put(rows_h - 1, 0, bar[:max(0, cols_w - 30)], DIM)
+    keys = "a:grid n/p:ch u:surf h:hud"
+    put(rows_h - 1, max(0, cols_w - len(keys) - 1), keys, DIM)
+
+
 # A monitor must never crash — render failures degrade to an error tile + a logged
 # traceback (~/.cache/fleet-overwatch-error.log) and an on-screen hint, never an exit.
 LAST_ERR = None
@@ -2878,20 +3845,32 @@ def ui(stdscr, interval, filter_names, want_fleet, want_vast, allow_attach):
     if want_vast:
         threading.Thread(target=vast_poller, args=(stop, max(8.0, interval), allow_attach),
                          daemon=True).start()
+    threading.Thread(target=hydra_poller, args=(stop,), daemon=True).start()
     def draw(snapshot, pinfo, rows_h, cols_w):
+        global LIVE_TOWER
         fleet_ok, fleet_total, pods, burn = summary(snapshot)
         ts = time.strftime("%H:%M:%S", time.localtime(pinfo.get("ts") or time.time()))
         put(0, 0, "❬ FLEET OVERWATCH ❭", LABEL)
         dup = f" · {len(DUP_HIDDEN)}dup" if DUP_HIDDEN else ""
+        heads, mail_new, mail_q = hydra_summary(snapshot)
+        hyd = f" · ⬡{heads} ✉{mail_new}" + (f"▸{mail_q}" if mail_q else "") if heads else ""
         gauge = f" ◔ {GAUGE_STYLES[GAUGE_IDX][0]} ◂v▸" if DUAL_GAUGE else ""
-        status = (f"{fleet_ok}/{fleet_total} fleet · {pods} pods · ${burn:.2f}/hr{dup}"
+        status = (f"{fleet_ok}/{fleet_total} fleet · {pods} pods · ${burn:.2f}/hr{dup}{hyd}"
                   f"   ▞ {BAR_THEMES[THEME_IDX][0]} ◂+/-▸ ▦ {SCHEMES[SCHEME_IDX]['name']} ◂c▸{gauge}"
                   f" ∿ {FIELD_STYLES[FIELD_IDX][0]} ◂f▸")
-        clock_x = max(20, cols_w - 26)
+        clock_x = max(20, cols_w - 30)
         put(0, 20, status[:max(0, clock_x - 21)], TEXT)   # clip so the clock never clobbers it
-        put(0, clock_x, f"{ts}  g:{'gauge' if DUAL_GAUGE else 'bars'} q:quit", DIM)
+        hint = "♪ ambient" if AMBIENT else f"a:amb g:{'gauge' if DUAL_GAUGE else 'bars'}"
+        put(0, clock_x, f"{ts} {hint} q:quit", DIM)
         if not snapshot:
             put(2, 0, "scanning fleet…  (first sweep may take a few seconds)", DIM)
+        if AMBIENT:
+            LIVE_TOWER = False
+            if snapshot:
+                draw_ambient(put, rows_h, cols_w, snapshot, ANIM_T)
+            if LAST_ERR:
+                put(rows_h - 1, 0, ("⚠ " + LAST_ERR)[:max(0, cols_w - 40)], CRIT)
+            return
         # Reserve a full-height column on the right for the dial tower; tiles fill only
         # the left region, so they can never collide with it.
         tg = tower_geom(snapshot, rows_h, cols_w)
@@ -2966,24 +3945,27 @@ def ui(stdscr, interval, filter_names, want_fleet, want_vast, allow_attach):
             y = draw_section(s[0], s[1], y, rows_h - vast_h)
         if vast_sec:
             draw_section(vast_sec[0], vast_sec[1], max(y, rows_h - vast_h), rows_h)
-        global LIVE_TOWER
         LIVE_TOWER = bool(tg)
         if tg:
             draw_tower(put, rows_h, cols_w, *tg, ANIM_T)
         if LAST_ERR:
             put(rows_h - 1, 0, ("⚠ " + LAST_ERR)[:max(0, cols_w - 1 - (tg[2] if tg else 0))], CRIT)
 
+    last_hist_ts = 0.0
     try:
         while True:
             # Fast redraw only while an animated theme is active; otherwise stay calm so
             # we don't flood the terminal with full-screen repaints (can choke WSL/remote).
-            _safe(stdscr.timeout, 110 if (theme_is_animated() or LIVE_TOWER) else 500)
+            _safe(stdscr.timeout, 110 if (theme_is_animated() or LIVE_TOWER or AMBIENT) else 500)
             rows_h, cols_w = 24, 80
             try:
                 _set_anim(time.time())
                 with LOCK:
                     snapshot = dict(LATEST)
                     pinfo = dict(POLL_INFO)
+                if pinfo.get("ts") and pinfo["ts"] != last_hist_ts:
+                    last_hist_ts = pinfo["ts"]
+                    note_fleet_sample(snapshot, pinfo["ts"])   # feed the fleet signal
                 rows_h, cols_w = stdscr.getmaxyx()
                 stdscr.erase()
                 draw(snapshot, pinfo, rows_h, cols_w)
@@ -3014,6 +3996,19 @@ def ui(stdscr, interval, filter_names, want_fleet, want_vast, allow_attach):
                 cycle_field(-1)
             elif ch in (ord("g"), ord("G")):
                 toggle_dual()
+            elif ch in (ord("a"), ord("A")):
+                toggle_ambient()
+            elif AMBIENT and ch in (ord("n"), curses.KEY_RIGHT):
+                cycle_channel(1)
+            elif AMBIENT and ch in (ord("p"), curses.KEY_LEFT):
+                cycle_channel(-1)
+            elif AMBIENT and ch in (ord("u"), ord("U")):
+                surf_channel()
+            elif AMBIENT and ch in (ord("h"), ord("H")):
+                toggle_hud()
+            elif AMBIENT and ch is not None and \
+                    ord("1") <= ch < ord("1") + min(9, len(CHANNELS)):
+                select_channel(ch - ord("1"))
             _safe(stdscr.refresh)
     finally:
         stop.set()
@@ -3041,6 +4036,20 @@ def render_plain(snapshot):
             g = f"{gpu:.1f}%" if gpu is not None else "··"
             c = f"{cpu:.1f}%" if cpu is not None else "··"
             lines.append(f"  {label:<6} GPU {g:>7}   CPU {c:>7}")
+    with LOCK:
+        hyd = dict(HYDRA_LOCAL)
+    if hyd.get("ok"):
+        ident, c, ib, ob = hyd["identity"], hyd["counts"], hyd["inbox"], hyd["outbox"]
+        lines.append("")
+        lines.append("── HYDRA (local head) ──")
+        lines.append(f"  {ident.get('hostname', '?')} · inbox {ib.get('new', 0)} new"
+                     f"/{ib.get('acked', 0)} acked · outbox {ob.get('queued', 0)} queued"
+                     f" · artifacts {c.get('artifacts', 0)} · peers {c.get('peers', 0)}"
+                     f" · health probes {c.get('model_health', 0)}")
+        for s in hyd["surfaces"]:
+            spark = "".join("▇" if ok else "▁" for _, ok in s["spark"]) or "· no probe history"
+            lines.append(f"  {s['state'][:9]:<9} {s['id'][:26]:<26} "
+                         f"{s['model'][:28]:<28} {spark} ✓{_iso_age(s['verified_at'])}")
     return "\n".join(lines)
 
 
@@ -3092,6 +4101,9 @@ def main():
                     help="gauge style (also v in the TUI): " + ", ".join(n for n, _, _ in GAUGE_STYLES))
     ap.add_argument("--field", default=None,
                     help="TOTALS field style (also f in the TUI): " + ", ".join(n for n, _ in FIELD_STYLES))
+    ap.add_argument("--ambient", nargs="?", const=True, default=None, metavar="CHANNEL",
+                    help="start in ambient mode (also 'a' in the TUI), optionally on a "
+                         "channel: " + ", ".join(n for n, _f, _d in CHANNELS))
     ap.add_argument("--no-vast-attach", action="store_true", help="disable auto-heal key attach")
     ap.add_argument("--vast-attach", action="store_true",
                     help="attach fleet key to all running pods, then exit")
@@ -3118,6 +4130,13 @@ def main():
         print(f"error: unknown field {args.field!r}; available: "
               + ", ".join(n for n, _ in FIELD_STYLES), file=sys.stderr)
         return 1
+    if args.ambient is not None:
+        global AMBIENT
+        AMBIENT = True
+        if isinstance(args.ambient, str) and not set_channel(args.ambient):
+            print(f"error: unknown channel {args.ambient!r}; available: "
+                  + ", ".join(n for n, _f, _d in CHANNELS), file=sys.stderr)
+            return 1
     filter_names = set(n.strip().lower() for n in args.nodes.split(",") if n.strip()) or None
     want_fleet = args.only != "vast"
     want_vast = (not args.no_vast) and args.only != "fleet"

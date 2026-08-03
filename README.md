@@ -55,6 +55,52 @@ and persists across runs (`~/.config/fleet-overwatch/prefs.json`):
   wave (standing waves), sync (hazard stripes) — GPU grows down from the top,
   CPU up from the base
 - `g` toggles between the gauge view and the classic metric-bars view
+- `a` tunes into **ambient mode** — 7 full-screen crabmusic-style channels
+  driven by live fleet telemetry (see below)
+
+## Hydra network data
+
+If a node runs a Hydra head (the rig-fleet agent mailbox / control-plane on
+`127.0.0.1:17876`), overwatch picks it up
+automatically — the SSH probe asks each node's own head for its `/status`
+in the same round-trip, so no extra connections and no remote auth:
+
+- **per-tile `⬡` line** — `✉ new+acked` inbox · `▸` queued outbox ·
+  `◈` registered model surfaces · `▣` artifacts (and `✗ dead letters` if any)
+- **header totals** — `⬡ heads · ✉ unread` across the whole fleet
+- **local head extras** — the model-surface registry (`/surfaces/list`) and
+  each surface's verification-probe history, read straight from the head's
+  SQLite spool (read-only), rendered as health sparklines
+- **events** — mailbox/artifact/health count deltas between polls become the
+  beat/pulse events of ambient mode
+
+Nodes without a head (or without `curl`) simply show nothing — every figure
+on screen is a head's own report.
+
+## Ambient mode — crabmusic channels
+
+`a` (or `--ambient [channel]`) turns the panel into a full-screen ambient
+visual in the spirit of CrabMusic's channel surfing, where the *fleet is the
+music*: bass = GPU load, mid = CPU load, treble =
+Hydra head activity, spectrum = one bin per real core/GPU, beat = a fresh
+mailbox event or a genuine GPU-load jump. A HUD overlay keeps per-node
+GPU/CPU readouts floating over the art, so it stays a monitor you can read
+across the room.
+
+| ch | name | what it shows |
+|----|-----------|--------------------------------------------------------------|
+| 1 | hydra     | the agent mesh: peers, mail pulses, model-surface registry with health sparklines |
+| 2 | spectrum  | EQ analyzer — every real core & GPU is a bin, peak caps included |
+| 3 | scope     | oscilloscope of the fleet-load history (GPU/CPU/Hydra traces) |
+| 4 | starfield | stars stream at warp ∝ GPU load; Hydra mail crosses as comets |
+| 5 | tunnel    | grid tunnel rushing at CPU pace, beat-flash on the nearest ring |
+| 6 | well      | gravity well — central mass is the VRAM actually in use, nodes orbit at their own CPU pace |
+| 7 | mandala   | breathing rose, one petal pair per live node — the pure-pleasure channel |
+
+Keys inside ambient: `n`/`p` (or ←/→) change channel · `1`–`7` tune direct ·
+`u` channel-surf · `h` hide/show the HUD · `a` back to the grid. Color
+schemes (`c`) and bar themes (`+`/`-`) restyle ambient mode live too, and the
+channel choice persists across runs.
 
 Start with a chosen look:
 `./overwatch.py --theme circuit --scheme cyber --gauge grid --field helix`
@@ -166,6 +212,8 @@ All keys are optional:
 --nodes a,b          subset of fleet nodes
 --only fleet|vast    one source only        --no-vast    hide pods
 --theme/--scheme/--gauge/--field NAME   start with a chosen look
+--ambient [CHANNEL]  start in ambient mode (hydra, spectrum, scope,
+                     starfield, tunnel, well, mandala)
 --config PATH        explicit config file
 --vast-attach        attach the fleet key to all running pods, then exit
 --no-vast-attach     disable the auto-heal attach pass
