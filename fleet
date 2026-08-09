@@ -32,7 +32,17 @@ roster() {
   printf '%s\n' "$_ROSTER"
 }
 
-user_for() { jq -r --arg n "$1" '.ssh_users[$n] // .default_user // "frosty40"' "$CONF" 2>/dev/null || echo frosty40; }
+# Prefer config ssh_users / default_user; otherwise the invoking user's login.
+# Never hardcode a personal username — this repo is public.
+user_for() {
+  local u
+  u="$(jq -r --arg n "$1" '(.ssh_users[$n] // .default_user // empty)' "$CONF" 2>/dev/null || true)"
+  if [ -n "$u" ] && [ "$u" != "null" ]; then
+    printf '%s\n' "$u"
+  else
+    printf '%s\n' "${USER:-$(id -un 2>/dev/null || echo root)}"
+  fi
+}
 role_for() { jq -r --arg n "$1" '.roles[$n] // "-"' "$CONF" 2>/dev/null || echo -; }
 
 # resolve a rig name -> "name ip os online self user" (one line); empty if unknown
@@ -52,7 +62,7 @@ linux_rigs() { roster | awk -F'\t' '$3=="linux" && $4=="true"{print $1}'; }
 PROBE='H=$(curl -s --max-time 2 http://127.0.0.1:'"$HYDRA_PORT"'/status 2>/dev/null||echo "");
 G=$(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null|head -1);
 T=$(tmux ls -F "#{session_name}" 2>/dev/null|paste -sd, -);
-S=$(systemctl --user is-active hermes-hydra-head.service 2>/dev/null); [ -n "$S" ]||S=$(systemctl is-active hydra-head.service 2>/dev/null); [ -n "$S" ]||S=n/a;
+S=$(systemctl --user is-active hydra-head.service 2>/dev/null); [ -n "$S" ]||S=$(systemctl is-active hydra-head.service 2>/dev/null); [ -n "$S" ]||S=n/a;
 printf "{\"head\":%s,\"gpu\":\"%s\",\"tmux\":\"%s\",\"svc\":\"%s\"}\n" "${H:-null}" "$G" "$T" "$S"'
 
 probe_rig() { # name ip self user -> json line (or {} on failure)

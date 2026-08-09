@@ -709,8 +709,11 @@ def vast_poller(stop, interval, allow_attach):
 # head's SQLite spool, read-only. Count deltas between polls become "events" —
 # real mailbox/artifact/health activity that the ambient channels render as
 # pulses. Nothing here is synthesized: no head, no data.
-HYDRA_URL = "http://127.0.0.1:17876"
-HYDRA_DB = os.path.expanduser("~/.hermes/hydra/hydra.db")
+HYDRA_URL = os.environ.get("HYDRA_URL") or "http://127.0.0.1:17876"
+# Spool path is site-specific; override with $HYDRA_DB. Generic default only.
+HYDRA_DB = os.path.expanduser(
+    os.environ.get("HYDRA_DB") or "~/.local/share/hydra/hydra.db"
+)
 HYDRA_SPARK_N = 24          # health-probe samples kept per surface for the sparkline
 
 HYDRA_LOCAL = {"ok": False, "identity": {}, "counts": {}, "inbox": {}, "outbox": {},
