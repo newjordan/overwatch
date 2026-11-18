@@ -122,7 +122,7 @@ ATTEMPTED_ATTACH = set()             # pod ids we've fired an auto-attach at thi
 
 # Remote probe: one ssh round-trip. Marker-delimited so we parse with a plain
 # split and never assume python3 on the remote. GPU via nvidia-smi (authoritative)
-# or xpu-smi (Intel, best-effort); CPU via /proc/stat (delta computed here).
+# or the built-in Intel Arc/Xe sysfs reader below; CPU via /proc/stat (delta here).
 PROBE = r'''
 echo "==GPUKIND=="
 if command -v nvidia-smi >/dev/null 2>&1; then echo nvidia
