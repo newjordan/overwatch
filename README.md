@@ -62,15 +62,16 @@ Start with a chosen look:
 ## Quickstart
 
 ```bash
-git clone <this-repo> && cd overwatch
+git clone https://github.com/newjordan/overwatch && cd overwatch
 ./overwatch.py --once        # one plain-text frame — verify discovery/probing
 ./overwatch.py               # live TUI (q quits)
 ```
 
-Optional local install:
+Optional local install — copy the launcher and the script together, since the
+launcher runs `overwatch.py` from its own directory:
 
 ```bash
-install -Dm755 overwatch ~/.local/bin/overwatch
+install -Dm755 overwatch overwatch.py -t ~/.local/bin
 overwatch --once
 ```
 
