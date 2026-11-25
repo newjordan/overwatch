@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleet-overwatch"
+version = "1.1.0"
+description = "Live GPU and CPU terminal panel for a Tailscale fleet"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Frosty40" }]
+keywords = ["tailscale", "gpu", "nvidia", "rocm", "tui", "monitoring"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+fleet-overwatch = "overwatch:main"
+overwatch = "overwatch:main"
+
+[project.urls]
+Homepage = "https://github.com/newjordan/overwatch"
+Repository = "https://github.com/newjordan/overwatch"
+
+[tool.setuptools]
+py-modules = ["overwatch"]
+packages = ["fleet_overwatch"]
+
+[tool.setuptools.package-data]
+fleet_overwatch = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -26,10 +26,13 @@ the current login user, and normal SSH configuration applies.
   ./overwatch.py --theme comet --scheme ember   # start with a chosen look
   ./overwatch.py --vast-attach   # attach fleet key to all running pods, then exit
   ./overwatch.py --no-vast-attach  # disable the auto-heal attach pass
+  ./overwatch.py --demo --once   # fictional fleet, no tailnet / SSH / GPU tools
 
 Keys: q quit · +/- bar theme · c/C color scheme · v/V gauge style · f/F field
 style · g gauge/bars view
 """
+
+from __future__ import annotations
 
 import argparse
 import curses
@@ -37,7 +40,6 @@ import json
 import locale
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +47,16 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+
+from fleet_overwatch.demo import build_demo_nodes
+from fleet_overwatch.parsing import (
+    classify_probe_error,
+    devices_from_tailscale_status,
+    metrics_from_sections,
+    parse_probe_sections,
+    short_gpu_name,
+)
 
 # ── Configuration ───────────────────────────────────────────────────────────
 # Everything site-specific is read from an optional JSON config (all keys
@@ -121,17 +133,21 @@ apply_config()           # module load: env var / cwd / XDG paths (no CLI yet)
 ATTEMPTED_ATTACH = set()             # pod ids we've fired an auto-attach at this run
 
 # Remote probe: one ssh round-trip. Marker-delimited so we parse with a plain
-# split and never assume python3 on the remote. GPU via nvidia-smi (authoritative)
+# split and never assume python3 on the remote. GPU via nvidia-smi, rocm-smi,
 # or the built-in Intel Arc/Xe sysfs reader below; CPU via /proc/stat (delta here).
+# Tool stdout is parsed locally (see fleet_overwatch.parsing).
 PROBE = r'''
 echo "==GPUKIND=="
 if command -v nvidia-smi >/dev/null 2>&1; then echo nvidia
+elif command -v rocm-smi >/dev/null 2>&1; then echo rocm
 elif readlink -f /sys/class/drm/card*/device/driver 2>/dev/null | grep -q '/xe$\|/i915$'; then echo intel
 else echo none; fi
 echo "==GPU=="
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
     --format=csv,noheader,nounits 2>/dev/null
+elif command -v rocm-smi >/dev/null 2>&1; then
+  rocm-smi --showuse --showmeminfo vram --showtemp --showpower --showproductname --csv 2>/dev/null
 else
   # Intel xe (Arc/Battlemage): our own sysfs/procfs reader (no intel_gpu_top, no perf,
   # no elevated privileges). Emits ONE CSV line matching the nvidia format: name,util%,memMiB used,
@@ -204,8 +220,12 @@ def find_vastai():
     return None
 
 
-def discover():
-    """Return list of tailnet devices: {name, host, ip, os, online, is_self}."""
+def discover() -> list[dict[str, Any]] | None:
+    """Return list of tailnet devices: {name, host, ip, os, online, is_self}.
+
+    A missing CLI, bad JSON, or a timed-out status call returns None so the
+    caller keeps the last good view instead of blanking the panel.
+    """
     ts = find_tailscale()
     if not ts:
         return None                      # can't discover -> caller keeps last view
@@ -215,31 +235,9 @@ def discover():
         data = json.loads(out)
     except Exception:
         return None
-
-    def short_name(node):
-        dns = (node.get("DNSName") or "").strip(".")
-        if dns:
-            return dns.split(".")[0].lower()
-        return (node.get("HostName") or "?").lower()
-
-    devices = []
-    self_node = data.get("Self") or {}
-    self_name = short_name(self_node) if self_node else None
-    for node in [self_node] + list((data.get("Peer") or {}).values()):
-        if not node:
-            continue
-        name = short_name(node)
-        if name in EXCLUDE:
-            continue
-        devices.append({
-            "name": name, "source": "fleet",
-            "host": node.get("HostName"),
-            "ip": (node.get("TailscaleIPs") or [""])[0],
-            "os": node.get("OS"),
-            "online": bool(node.get("Online")) or (name == self_name),
-            "is_self": name == self_name,
-        })
-    return _dedup_by_host(devices)
+    if not isinstance(data, dict):
+        return None
+    return _dedup_by_host(devices_from_tailscale_status(data, exclude=EXCLUDE))
 
 
 # Two tailnet devices sharing a HostName are the SAME physical machine — e.g. a box
@@ -321,7 +319,21 @@ def vast_discover():
 
 
 # ── Probing ─────────────────────────────────────────────────────────────────
-def _run_probe(target, port=None, opts=None):
+def _short_gpu(name: str) -> str:
+    return short_gpu_name(name)
+
+
+def _parse_probe(text: str) -> dict[str, list[str]]:
+    """Marker-delimited probe output -> sections dict."""
+    return parse_probe_sections(text)
+
+
+def _parse_metrics(sec: dict[str, list[str]]) -> dict[str, Any]:
+    """Shared parse of a probe's sections into gpus + cpu/mem fields."""
+    return metrics_from_sections(sec)
+
+
+def _run_probe(target: str, port: str | int | None = None, opts: list[str] | None = None) -> str:
     """Run PROBE on `target` ('LOCAL' or ssh dest). Returns stdout or raises."""
     if target == "LOCAL":
         cp = subprocess.run(["bash", "-c", PROBE], capture_output=True,
@@ -339,83 +351,7 @@ def _run_probe(target, port=None, opts=None):
     return cp.stdout
 
 
-def _parse_probe(text):
-    """Marker-delimited probe output -> sections dict."""
-    sections, cur = {}, None
-    for line in text.splitlines():
-        m = re.match(r"^==(\w+)==$", line)
-        if m:
-            cur = m.group(1)
-            sections[cur] = []
-        elif cur is not None:
-            sections[cur].append(line)
-    return sections
-
-
-def _short_gpu(name):
-    name = re.sub(r"^NVIDIA\s+GeForce\s+", "", name)
-    name = re.sub(r"^NVIDIA\s+", "", name)
-    return re.sub(r"\s+GPU$", "", name).strip()
-
-
-def _cpu_busy_total(cpu_line):
-    # "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
-    parts = cpu_line.split()
-    vals = [int(x) for x in parts[1:] if x.isdigit()]
-    if len(vals) < 4:
-        return None
-    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
-    total = sum(vals)
-    return total - idle, total
-
-
-def _parse_metrics(sec):
-    """Shared parse of a probe's sections into gpus + cpu/mem fields."""
-    def num(x):
-        try:
-            return float(x)
-        except ValueError:
-            return None
-
-    gpus = []
-    for line in sec.get("GPU", []):
-        if not line.strip():
-            continue
-        f = [c.strip() for c in line.split(",")]
-        if len(f) >= 6:
-            gpus.append({"name": _short_gpu(f[0]), "util": num(f[1]),
-                         "mem_used": num(f[2]), "mem_total": num(f[3]),
-                         "temp": num(f[4]), "power": num(f[5])})
-
-    agg_bt, core_bt = None, []
-    for line in sec.get("CPU", []):
-        parts = line.split()
-        if not parts or not parts[0].startswith("cpu"):
-            continue
-        bt = _cpu_busy_total(line)
-        if parts[0] == "cpu":          # the aggregate "cpu " line
-            agg_bt = bt
-        elif parts[0][3:].isdigit() and bt:   # per-core "cpuN" lines
-            core_bt.append(bt)
-    ncpu = (sec.get("NPROC") or [""])[0].strip()
-    load = (sec.get("LOAD") or [""])[0].split()[:3]
-    mem = {}
-    for ln in sec.get("MEM", []):
-        m = re.match(r"(\w+):\s+(\d+)", ln)
-        if m:
-            mem[m.group(1)] = int(m.group(2))
-    up = (sec.get("UPTIME") or [""])[0].strip()
-    return {
-        "gpukind": (sec.get("GPUKIND") or ["none"])[0].strip(),
-        "gpus": gpus, "cpu_bt": agg_bt, "core_bt": core_bt,
-        "ncpu": int(ncpu) if ncpu.isdigit() else None,
-        "load": [float(x) for x in load] if load else None,
-        "mem_total_kb": mem.get("MemTotal"), "mem_avail_kb": mem.get("MemAvailable"),
-        "uptime_s": float(up) if re.match(r"^[\d.]+$", up) else None,
-    }
-
-
-def ssh_target(dev):
+def ssh_target(dev: dict[str, Any]) -> str | None:
     """Tailscale-based SSH destination for a device, or None if not probeable.
     Host is always the device's Tailscale IP; user from SSH_USER (then
     DEFAULT_USER, then ssh's own default user and config)."""
@@ -429,17 +365,19 @@ def ssh_target(dev):
     return f"{user}@{dev['ip']}" if user else dev["ip"]
 
 
-def collect(dev):
-    """Probe one tailnet device. Returns raw-metrics dict (ok/unreachable/nossh)."""
+def collect(dev: dict[str, Any]) -> dict[str, Any]:
+    """Probe one tailnet device. Returns raw metrics (ok/down/unreachable/nossh).
+
+    A dead SSH session is a status, not an exception: one host being down never
+    escapes this function, so the rest of the sweep keeps going.
+    """
     target = ssh_target(dev)
     if target is None:
         return {"status": "nossh"}
     try:
         sec = _parse_probe(_run_probe(target))
-    except subprocess.TimeoutExpired:
-        return {"status": "unreachable", "err": "timeout"}
-    except Exception as e:
-        return {"status": "unreachable", "err": str(e)[:40]}
+    except Exception as exc:
+        return classify_probe_error(exc)
     res = {"status": "ok", **_parse_metrics(sec)}
     if res.get("gpukind") == "intel":          # give the xe card its friendly model name
         lbl = GPU_LABEL.get(dev["name"])
@@ -474,6 +412,7 @@ def collect_vast(pod, allow_attach=True):
         return {"status": "offline"}
     a = pod["api"]
     host, port = pod.get("ssh_host"), pod.get("ssh_port")
+    failure: dict[str, str] | None = None
     if host and port:
         try:
             sec = _parse_probe(_run_probe(f"{VAST_USER}@{host}", port=port, opts=VAST_SSH_OPTS))
@@ -491,8 +430,11 @@ def collect_vast(pod, allow_attach=True):
                 "mem_avail_kb": int((ml - mu) * 1024 * 1024) if (ml is not None and mu is not None) else None,
                 "uptime_s": pod["uptime_mins"] * 60 if pod.get("uptime_mins") else None,
             }
-        except Exception:
+        except Exception as exc:
             # SSH failed — fire a one-time auto-attach so the next scan succeeds.
+            # The pod stays on screen either way: API numbers if we have them,
+            # otherwise a down/unreachable tile. The exception does not propagate.
+            failure = classify_probe_error(exc)
             if allow_attach and pod["id"] not in ATTEMPTED_ATTACH:
                 ATTEMPTED_ATTACH.add(pod["id"])
                 vast_attach(pod["id"])
@@ -512,6 +454,8 @@ def collect_vast(pod, allow_attach=True):
             "mem_avail_kb": int((ml - mu) * 1024 * 1024) if (ml is not None and mu is not None) else None,
             "uptime_s": pod["uptime_mins"] * 60 if pod.get("uptime_mins") else None,
         }
+    if failure:
+        return {**failure, "detail": "no ssh / no api"}
     return {"status": "unreachable", "detail": "no ssh / no api", "err": "unreachable"}
 
 
@@ -597,10 +541,18 @@ def refresh_source(source, items, ok, collect_fn):
         with ThreadPoolExecutor(max_workers=12) as ex:
             futs = {ex.submit(collect_fn, d): d for d in online}
             for fut in as_completed(futs):
+                dev = futs[fut]
                 try:
-                    _ingest(futs[fut], fut.result())
+                    result = fut.result()
                 except Exception as e:
-                    _log_err(f"collect {futs[fut].get('name')}", e)
+                    # collect() already swallows probe errors; this is a bug in a
+                    # collector. Record the host as down and keep the other futures.
+                    _log_err(f"collect {dev.get('name')}", e)
+                    result = {"status": "down", "err": "probe failed"}
+                try:
+                    _ingest(dev, result)
+                except Exception as e:
+                    _log_err(f"ingest {dev.get('name')}", e)
     except RuntimeError:
         pass        # interpreter shutting down (daemon poller mid-cycle) -> exit quietly
 
@@ -613,7 +565,23 @@ def _fleet_items(filter_names):
     return items, res is not None
 
 
-def poll_once(filter_names=None, want_fleet=True, want_vast=True, allow_attach=True):
+DEMO_MODE = False
+
+
+def apply_demo_snapshot(tick: int = 0) -> None:
+    """Replace the draw snapshot with the fictional fleet. Does not touch the network."""
+    nodes = build_demo_nodes(tick)
+    with LOCK:
+        for key in list(LATEST):
+            if key not in nodes:
+                del LATEST[key]
+        LATEST.update(nodes)
+        POLL_INFO["ts"] = time.time()
+        POLL_INFO["dur"] = 0.0
+
+
+def poll_once(filter_names: set[str] | None = None, want_fleet: bool = True,
+              want_vast: bool = True, allow_attach: bool = True) -> None:
     """One synchronous sweep of both sources (used by --once and the plain fallback)."""
     t0 = time.time()
     if want_fleet:
@@ -642,7 +610,7 @@ def fleet_poller(stop, interval, filter_names):
             break
 
 
-def vast_poller(stop, interval, allow_attach):
+def vast_poller(stop: threading.Event, interval: float, allow_attach: bool) -> None:
     while not stop.is_set():
         try:
             res = vast_discover()
@@ -651,6 +619,20 @@ def vast_poller(stop, interval, allow_attach):
         except Exception as e:
             if not stop.is_set():
                 _log_err("vast_poll", e)
+        if stop.wait(interval):
+            break
+
+
+def demo_poller(stop: threading.Event, interval: float) -> None:
+    """Animate the fictional fleet. Never calls tailscale, ssh, or vastai."""
+    tick = 0
+    while not stop.is_set():
+        try:
+            apply_demo_snapshot(tick)
+            tick += 1
+        except Exception as e:
+            if not stop.is_set():
+                _log_err("demo_poll", e)
         if stop.wait(interval):
             break
 
@@ -2282,7 +2264,7 @@ def build_tile(node, compact=False):
     is_vast = node.get("source") == "vast"
     dot = ("●" if status == "ok" else "◐" if status in ("api", "nossh", "unreachable")
            else "◌" if status == "scanning" else "○")
-    dot_key = {"ok": OK, "api": WARN, "nossh": WARN, "unreachable": CRIT}.get(status, DIM)
+    dot_key = {"ok": OK, "api": WARN, "nossh": WARN, "unreachable": CRIT, "down": DIM}.get(status, DIM)
 
     # Top border with embedded name + status dot, total width == TILE_W.
     head = f"┌─ {name} "
@@ -2308,6 +2290,9 @@ def build_tile(node, compact=False):
     elif status == "unreachable":
         rows.append(_pad([(" online · no reply", WARN)]))
         rows.append(_pad([(f" {node.get('err') or 'ssh failed'}", DIM)]))
+    elif status == "down":
+        rows.append(_pad([(" ░ host down", DIM)]))
+        rows.append(_pad([(f" {(node.get('err') or 'no reply')[:CW - 2]}", DIM)]))
     elif status == "scanning":
         rows.append(_pad([(" scanning…", DIM)]))
         rows.append(_pad([(" ", DIM)]))
@@ -2808,7 +2793,8 @@ def safe_tile(node, compact=False):
 
 
 # ── Curses UI ───────────────────────────────────────────────────────────────
-def ui(stdscr, interval, filter_names, want_fleet, want_vast, allow_attach):
+def ui(stdscr: Any, interval: float, filter_names: set[str] | None,
+       want_fleet: bool, want_vast: bool, allow_attach: bool, demo: bool = False) -> None:
     _safe(locale.setlocale, locale.LC_ALL, "")
     _safe(curses.curs_set, 0)
     has_color = False
@@ -2872,23 +2858,27 @@ def ui(stdscr, interval, filter_names, want_fleet, want_vast, allow_attach):
     # (it's network-bound + API-lagged). Each touches only its own tiles, so a slow
     # Vast scan can't stall or flicker the fleet, and vice-versa.
     stop = threading.Event()
-    if want_fleet:
-        threading.Thread(target=fleet_poller, args=(stop, interval, filter_names),
-                         daemon=True).start()
-    if want_vast:
-        threading.Thread(target=vast_poller, args=(stop, max(8.0, interval), allow_attach),
-                         daemon=True).start()
+    if demo:
+        threading.Thread(target=demo_poller, args=(stop, interval), daemon=True).start()
+    else:
+        if want_fleet:
+            threading.Thread(target=fleet_poller, args=(stop, interval, filter_names),
+                             daemon=True).start()
+        if want_vast:
+            threading.Thread(target=vast_poller, args=(stop, max(8.0, interval), allow_attach),
+                             daemon=True).start()
     def draw(snapshot, pinfo, rows_h, cols_w):
         fleet_ok, fleet_total, pods, burn = summary(snapshot)
         ts = time.strftime("%H:%M:%S", time.localtime(pinfo.get("ts") or time.time()))
-        put(0, 0, "❬ FLEET OVERWATCH ❭", LABEL)
+        brand = "❬ FLEET OVERWATCH · DEMO ❭" if (demo or DEMO_MODE) else "❬ FLEET OVERWATCH ❭"
+        put(0, 0, brand, LABEL)
         dup = f" · {len(DUP_HIDDEN)}dup" if DUP_HIDDEN else ""
         gauge = f" ◔ {GAUGE_STYLES[GAUGE_IDX][0]} ◂v▸" if DUAL_GAUGE else ""
         status = (f"{fleet_ok}/{fleet_total} fleet · {pods} pods · ${burn:.2f}/hr{dup}"
                   f"   ▞ {BAR_THEMES[THEME_IDX][0]} ◂+/-▸ ▦ {SCHEMES[SCHEME_IDX]['name']} ◂c▸{gauge}"
                   f" ∿ {FIELD_STYLES[FIELD_IDX][0]} ◂f▸")
-        clock_x = max(20, cols_w - 26)
-        put(0, 20, status[:max(0, clock_x - 21)], TEXT)   # clip so the clock never clobbers it
+        clock_x = max(len(brand) + 2, cols_w - 26)
+        put(0, len(brand) + 1, status[:max(0, clock_x - len(brand) - 2)], TEXT)
         put(0, clock_x, f"{ts}  g:{'gauge' if DUAL_GAUGE else 'bars'} q:quit", DIM)
         if not snapshot:
             put(2, 0, "scanning fleet…  (first sweep may take a few seconds)", DIM)
@@ -3020,10 +3010,11 @@ def ui(stdscr, interval, filter_names, want_fleet, want_vast, allow_attach):
 
 
 # ── Plain-text one-shot (debug / verification) ──────────────────────────────
-def render_plain(snapshot):
+def render_plain(snapshot: dict[str, Any]) -> str:
     lines = []
     fleet_ok, fleet_total, pods, burn = summary(snapshot)
-    lines.append(f"❬ FLEET OVERWATCH ❭  {fleet_ok}/{fleet_total} fleet · {pods} pods · "
+    brand = "❬ FLEET OVERWATCH · DEMO ❭" if DEMO_MODE else "❬ FLEET OVERWATCH ❭"
+    lines.append(f"{brand}  {fleet_ok}/{fleet_total} fleet · {pods} pods · "
                  f"${burn:.2f}/hr  {time.strftime('%H:%M:%S')}")
     for title, members in grouped(snapshot):
         lines.append("")
@@ -3044,13 +3035,19 @@ def render_plain(snapshot):
     return "\n".join(lines)
 
 
-def plain_loop(interval, filter_names, want_fleet, want_vast, allow_attach):
+def plain_loop(interval: float, filter_names: set[str] | None, want_fleet: bool,
+               want_vast: bool, allow_attach: bool, demo: bool = False) -> None:
     """Non-curses fallback: ANSI clear + render_plain on a timer. Never touches curses,
     so it survives terminals where the TUI can't init. Ctrl-C to quit."""
+    tick = 0
     try:
         while True:
             try:
-                poll_once(filter_names, want_fleet, want_vast, allow_attach)
+                if demo:
+                    apply_demo_snapshot(tick)
+                    tick += 1
+                else:
+                    poll_once(filter_names, want_fleet, want_vast, allow_attach)
                 with LOCK:
                     snap = dict(LATEST)
                 sys.stdout.write("\033[2J\033[H" + render_plain(snap) + "\n")
@@ -3064,8 +3061,11 @@ def plain_loop(interval, filter_names, want_fleet, want_vast, allow_attach):
         pass
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Fleet Overwatch — tailnet + Vast GPU/CPU panel")
+def main(argv: list[str] | None = None) -> int:
+    global DEMO_MODE
+    ap = argparse.ArgumentParser(
+        prog="fleet-overwatch",
+        description="Fleet Overwatch — tailnet + Vast GPU/CPU panel")
     ap.add_argument("--config", default=None,
                     help="JSON config path (default: $FLEET_OVERWATCH_CONFIG, "
                          "./overwatch.config.json, ~/.config/fleet-overwatch/config.json)")
@@ -3085,7 +3085,9 @@ def main():
     ap.add_argument("--no-vast-attach", action="store_true", help="disable auto-heal key attach")
     ap.add_argument("--vast-attach", action="store_true",
                     help="attach fleet key to all running pods, then exit")
-    args = ap.parse_args()
+    ap.add_argument("--demo", action="store_true",
+                    help="render a fictional fleet locally; no Tailscale, SSH, or Vast calls")
+    args = ap.parse_args(argv)
     if args.config:
         if not os.path.exists(args.config):
             print(f"error: config not found: {args.config}", file=sys.stderr)
@@ -3112,6 +3114,28 @@ def main():
     want_fleet = args.only != "vast"
     want_vast = (not args.no_vast) and args.only != "fleet"
     allow_attach = not args.no_vast_attach
+
+    # Demo never discovers or probes. It is safe on a machine with no tailnet.
+    if args.demo:
+        DEMO_MODE = True
+        if args.once:
+            apply_demo_snapshot(0)
+            with LOCK:
+                snapshot = dict(LATEST)
+            print(render_plain(snapshot))
+            return 0
+        try:
+            curses.wrapper(ui, args.interval, filter_names, False, False, False, True)
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            _log_err("curses", e)
+            sys.stderr.write(
+                f"overwatch: curses UI failed ({type(e).__name__}: {e}); falling back to plain "
+                f"auto-refresh (Ctrl-C to quit). Traceback logged to {ERR_LOG}\n")
+            time.sleep(1.5)
+            plain_loop(args.interval, filter_names, False, False, False, demo=True)
+        return 0
 
     # Standalone heal pass: attach the fleet key to every running pod, then exit.
     if args.vast_attach:
