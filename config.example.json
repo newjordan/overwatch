@@ -1,9 +1,23 @@
 {
-  "ssh_users": {},
+  "_comment": "Copy to ~/.config/fleet-overwatch/config.json. Every key is optional. The names below are placeholders — replace them with your own tailnet device names. With no config at all, every Linux device is probed as the current SSH user.",
+  "ssh_users": {
+    "node-a": "operator",
+    "node-b": "service",
+    "node-c": "admin"
+  },
   "default_user": null,
-  "gpu_labels": {},
-  "exclude": [],
-  "order": [],
+  "gpu_labels": {
+    "node-c": "Example GPU"
+  },
+  "exclude": [
+    "phone",
+    "windows-peer"
+  ],
+  "order": [
+    "node-a",
+    "node-b",
+    "node-c"
+  ],
   "vast_key": "~/.ssh/fleet_overwatch_ed25519",
   "vast_user": "root",
   "tailscale_paths": null,
